@@ -1,0 +1,26 @@
+# Virtual Environment
+.venv/
+gesture_env/
+venv/
+env/
+
+# MediaPipe model (auto-downloaded on first run)
+hand_landmarker.task
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
