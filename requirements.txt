@@ -9,4 +9,5 @@ numpy>=1.21.0
 # Windows system control
 pycaw>=20230407
 pywin32>=227
+pyautogui>=0.9.54
 

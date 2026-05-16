@@ -18,6 +18,10 @@ from comtypes import CLSCTX_ALL
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 import win32api
 import win32con
+import pyautogui
+
+# Disable PyAutoGUI fail-safe for smoother control
+pyautogui.FAILSAFE = False
 
 # MediaPipe imports for 0.10.x
 try:
@@ -76,14 +80,21 @@ class HandGestureController:
         print("  Press 'q' to quit\n")
 
     def _get_model_path(self):
-        """Get or download hand landmarker model."""
+        """Get or download hand landmarker model (PyInstaller compatible)."""
         import os
+        import sys
         import urllib.request
         import ssl
         
         model_file = "hand_landmarker.task"
-        model_url = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
         
+        # Support for PyInstaller bundle path
+        if hasattr(sys, '_MEIPASS'):
+            bundle_path = os.path.join(sys._MEIPASS, model_file)
+            if os.path.exists(bundle_path):
+                return bundle_path
+        
+        # Regular path
         if os.path.exists(model_file):
             return model_file
         
@@ -122,22 +133,26 @@ class HandGestureController:
             raise RuntimeError("Failed to download hand landmarker model")
 
     def detect_fingers_up(self, landmarks):
-        """Detect which fingers are up with better precision."""
+        """Detect which fingers are up with improved robustness."""
         fingers = []
 
-        # Thumb (check distance from palm center to be hand-agnostic)
-        # We compare thumb tip (4) distance to pinky mcp (17) vs thumb cmc (2)
-        if landmarks[4].x < landmarks[3].x: # Basic check for right hand
-             fingers.append(1)
-        else:
-             fingers.append(0)
+        # 1. Thumb (Improved: Check distance from index base to detect 'open' thumb)
+        # Using distance between thumb tip(4) and index mcp(5)
+        dist_thumb_index = np.linalg.norm(
+            np.array([landmarks[4].x, landmarks[4].y]) - 
+            np.array([landmarks[5].x, landmarks[5].y])
+        )
+        if dist_thumb_index > 0.08: # Thumb is out
+            fingers.append(1)
+        else: # Thumb is tucked in
+            fingers.append(0)
 
-        # Other 4 fingers (Strict check: tip must be significantly above pip)
-        finger_tips = [8, 12, 16, 20]  # Index, Middle, Ring, Pinky
+        # 2. Other 4 fingers (Check if tip is above middle joint)
+        finger_tips = [8, 12, 16, 20]
         finger_pips = [6, 10, 14, 18]
-
         for tip, pip in zip(finger_tips, finger_pips):
-            if landmarks[tip].y < landmarks[pip].y - 0.02: # Added offset for stability
+            # Very sensitive: if tip is even slightly above pip
+            if landmarks[tip].y < landmarks[pip].y + 0.01:
                 fingers.append(1)
             else:
                 fingers.append(0)
@@ -145,23 +160,24 @@ class HandGestureController:
         return fingers
 
     def get_gesture(self, fingers, landmarks):
-        """Determine gesture strictly based on user requirements."""
-        total_fingers = sum(fingers)
+        """Determine gesture with simplified logic for better reliability."""
+        # Focus on the 4 main fingers for scrolling (ignore thumb)
+        main_fingers_up = sum(fingers[1:]) 
         
-        # ✋ Open Hand (Scroll Up)
-        if total_fingers >= 4:
+        # ✋ Scroll Up (All 4 main fingers up)
+        if main_fingers_up == 4:
             return "SCROLL_UP"
             
-        # ✊ Fist (Scroll Down)
-        if total_fingers == 0:
+        # ✊ Scroll Down (All 4 main fingers down)
+        if main_fingers_up == 0:
             return "SCROLL_DOWN"
             
         # ☝️ Index Finger ONLY (Volume Up)
-        if fingers[1] == 1 and fingers[2] == 0 and fingers[3] == 0:
+        if fingers[1] == 1 and fingers[2] == 0:
             return "VOL_UP"
             
         # 👆 Index + Middle (Volume Down)
-        if fingers[1] == 1 and fingers[2] == 1 and fingers[3] == 0:
+        if fingers[1] == 1 and fingers[2] == 1:
             return "VOL_DOWN"
 
         return "NONE"
@@ -302,23 +318,27 @@ class HandGestureController:
 
                 gesture_text, color = gesture_map.get(gesture, ("WAITING...", (128, 128, 128)))
 
-                # Execute actions based on stable gesture
+                # Execute actions based on current gesture (instant for scrolling)
                 if gesture == "SCROLL_UP":
-                    win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, 150, 0) # Faster scroll
+                    pyautogui.scroll(300) # Faster, more reliable scroll
                     action_text = "SCROLLING UP"
+                    print("[DEBUG] ACTION: SCROLL UP")
                 elif gesture == "SCROLL_DOWN":
-                    win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, -150, 0)
+                    pyautogui.scroll(-300)
                     action_text = "SCROLLING DOWN"
+                    print("[DEBUG] ACTION: SCROLL DOWN")
                 elif gesture == "VOL_UP":
                     current_vol = self.volume.GetMasterVolumeLevel()
                     new_vol = min(current_vol + 1.0, self.max_vol)
                     self.volume.SetMasterVolumeLevel(new_vol, None)
                     action_text = "VOLUME +"
+                    print(f"[DEBUG] ACTION: VOL UP ({new_vol:.1f})")
                 elif gesture == "VOL_DOWN":
                     current_vol = self.volume.GetMasterVolumeLevel()
                     new_vol = max(current_vol - 1.0, self.min_vol)
                     self.volume.SetMasterVolumeLevel(new_vol, None)
                     action_text = "VOLUME -"
+                    print(f"[DEBUG] ACTION: VOL DOWN ({new_vol:.1f})")
 
                 # Draw finger count
                 finger_count = sum(fingers)
