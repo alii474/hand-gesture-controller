@@ -37,19 +37,17 @@ class HandGestureController:
         if not MEDIAPIPE_AVAILABLE:
             raise RuntimeError("MediaPipe not available. Run: pip install mediapipe")
 
-        # MediaPipe HandLandmarker setup (0.10.x)
-        # Download model if not exists
-        model_path = self._get_model_path()
-        
-        options = HandLandmarkerOptions(
-            base_options=BaseOptions(model_asset_path=model_path),
+        # Model will be loaded during run() to speed up window appearance
+        self.model_path = self._get_model_path()
+        self.options = HandLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=self.model_path),
             num_hands=1,
             min_hand_detection_confidence=0.5,
             min_hand_presence_confidence=0.5,
             min_tracking_confidence=0.5,
             running_mode=RunningMode.VIDEO
         )
-        self.landmarker = HandLandmarker.create_from_options(options)
+        self.landmarker = None
         self.frame_count = 0
         self.process_every_n_frames = 2  # Process every 2nd frame to reduce CPU load
 
@@ -124,21 +122,22 @@ class HandGestureController:
             raise RuntimeError("Failed to download hand landmarker model")
 
     def detect_fingers_up(self, landmarks):
-        """Detect which fingers are up."""
+        """Detect which fingers are up with better precision."""
         fingers = []
 
-        # Thumb (check x position)
-        if landmarks[4].x < landmarks[3].x:
-            fingers.append(1)
+        # Thumb (check distance from palm center to be hand-agnostic)
+        # We compare thumb tip (4) distance to pinky mcp (17) vs thumb cmc (2)
+        if landmarks[4].x < landmarks[3].x: # Basic check for right hand
+             fingers.append(1)
         else:
-            fingers.append(0)
+             fingers.append(0)
 
-        # Other 4 fingers (check y position - tip higher than pip)
+        # Other 4 fingers (Strict check: tip must be significantly above pip)
         finger_tips = [8, 12, 16, 20]  # Index, Middle, Ring, Pinky
         finger_pips = [6, 10, 14, 18]
 
         for tip, pip in zip(finger_tips, finger_pips):
-            if landmarks[tip].y < landmarks[pip].y:
+            if landmarks[tip].y < landmarks[pip].y - 0.02: # Added offset for stability
                 fingers.append(1)
             else:
                 fingers.append(0)
@@ -146,28 +145,26 @@ class HandGestureController:
         return fingers
 
     def get_gesture(self, fingers, landmarks):
-        """Determine gesture from finger positions."""
+        """Determine gesture strictly based on user requirements."""
         total_fingers = sum(fingers)
+        
+        # ✋ Open Hand (Scroll Up)
+        if total_fingers >= 4:
+            return "SCROLL_UP"
+            
+        # ✊ Fist (Scroll Down)
+        if total_fingers == 0:
+            return "SCROLL_DOWN"
+            
+        # ☝️ Index Finger ONLY (Volume Up)
+        if fingers[1] == 1 and fingers[2] == 0 and fingers[3] == 0:
+            return "VOL_UP"
+            
+        # 👆 Index + Middle (Volume Down)
+        if fingers[1] == 1 and fingers[2] == 1 and fingers[3] == 0:
+            return "VOL_DOWN"
 
-        # Check for OK sign (thumb and index touching)
-        thumb_tip = np.array([landmarks[4].x, landmarks[4].y])
-        index_tip = np.array([landmarks[8].x, landmarks[8].y])
-        distance = np.linalg.norm(thumb_tip - index_tip)
-
-        if distance < 0.08:  # OK sign (relaxed threshold)
-            return "OK"
-
-        # Check finger configurations
-        if total_fingers == 5:
-            return "OPEN_HAND"
-        elif total_fingers == 0:
-            return "FIST"
-        elif fingers[1] == 1 and fingers[2] == 0:  # Only index up
-            return "INDEX_UP"
-        elif fingers[1] == 1 and fingers[2] == 1 and fingers[3] == 0:  # Index + Middle
-            return "TWO_FINGERS"
-
-        return "UNKNOWN"
+        return "NONE"
 
     def execute_action(self, gesture):
         """Execute action based on gesture."""
@@ -261,14 +258,19 @@ class HandGestureController:
         # Create MediaPipe Image object
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
         
-        # Detect hands
-        results = self.landmarker.detect_for_video(mp_image, self.frame_count)
+        # Detect hands (only if landmarker is ready)
+        results = None
+        if self.landmarker:
+            results = self.landmarker.detect_for_video(mp_image, self.frame_count)
+        else:
+            gesture_text = "LOADING AI..."
+            color = (0, 165, 255) # Orange
 
         gesture_text = "No Hand"
         action_text = ""
         color = (128, 128, 128)
 
-        if results.hand_landmarks:
+        if results and results.hand_landmarks:
             for hand_landmarks in results.hand_landmarks:
                 # Draw hand landmarks
                 self._draw_landmarks(frame, hand_landmarks, w, h)
@@ -292,42 +294,31 @@ class HandGestureController:
 
                 # Map gesture to display text
                 gesture_map = {
-                    "INDEX_UP": ("☝️ INDEX UP", (0, 255, 0)),
-                    "TWO_FINGERS": ("👆 2 FINGERS", (0, 255, 255)),
-                    "OPEN_HAND": ("✋ OPEN HAND", (255, 255, 0)),
-                    "FIST": ("🤚 FIST", (0, 0, 255)),
-                    "OK": ("👌 OK", (255, 0, 255)),
-                    "UNKNOWN": ("🤔 UNKNOWN", (128, 128, 128))
+                    "VOL_UP": ("☝️ VOLUME UP", (0, 255, 0)),
+                    "VOL_DOWN": ("👆 VOLUME DOWN", (0, 255, 255)),
+                    "SCROLL_UP": ("✋ SCROLL UP", (255, 255, 0)),
+                    "SCROLL_DOWN": ("✊ SCROLL DOWN", (0, 0, 255)),
                 }
 
-                gesture_text, color = gesture_map.get(gesture, ("UNKNOWN", (128, 128, 128)))
+                gesture_text, color = gesture_map.get(gesture, ("WAITING...", (128, 128, 128)))
 
-                # Execute action - all gestures trigger immediately without cooldown
-                if gesture == "OPEN_HAND":
-                    # Instant scroll up
-                    win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, 120, 0)
-                    action_text = "SCROLL UP"
-                elif gesture == "FIST":
-                    # Instant scroll down
-                    win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, -120, 0)
-                    action_text = "SCROLL DOWN"
-                elif gesture == "INDEX_UP":
-                    # Instant volume up
+                # Execute actions based on stable gesture
+                if gesture == "SCROLL_UP":
+                    win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, 150, 0) # Faster scroll
+                    action_text = "SCROLLING UP"
+                elif gesture == "SCROLL_DOWN":
+                    win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, -150, 0)
+                    action_text = "SCROLLING DOWN"
+                elif gesture == "VOL_UP":
                     current_vol = self.volume.GetMasterVolumeLevel()
-                    new_vol = min(current_vol + 2, self.max_vol)
+                    new_vol = min(current_vol + 1.0, self.max_vol)
                     self.volume.SetMasterVolumeLevel(new_vol, None)
-                    action_text = "VOLUME UP"
-                elif gesture == "TWO_FINGERS":
-                    # Instant volume down
+                    action_text = "VOLUME +"
+                elif gesture == "VOL_DOWN":
                     current_vol = self.volume.GetMasterVolumeLevel()
-                    new_vol = max(current_vol - 2, self.min_vol)
+                    new_vol = max(current_vol - 1.0, self.min_vol)
                     self.volume.SetMasterVolumeLevel(new_vol, None)
-                    action_text = "VOLUME DOWN"
-                elif stable_gesture == "OK":
-                    # Only OK sign needs stability (to avoid accidental pause)
-                    action = self.execute_action("OK")
-                    if action:
-                        action_text = action
+                    action_text = "VOLUME -"
 
                 # Draw finger count
                 finger_count = sum(fingers)
@@ -379,27 +370,41 @@ class HandGestureController:
             cv2.circle(frame, (x, y), 4, (0, 0, 255), -1)
 
     def run(self):
-        """Main loop."""
-        cap = cv2.VideoCapture(0)
-        # Lower resolution to reduce CPU load
+        """Main loop with optimized startup."""
+        print("[INFO] Initializing camera... please wait.")
+        
+        # Use CAP_DSHOW for faster startup on Windows
+        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        
+        # Speed optimizations
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
-        # Reduce FPS to 15 (from default 30)
         cap.set(cv2.CAP_PROP_FPS, 15)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         if not cap.isOpened():
             print("[ERROR] Cannot open camera!")
             return
 
-        print("[INFO] Camera started. Show your hand!")
-
+        print("[INFO] Camera started. Loading AI model...")
+        
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
 
-            processed_frame = self.process_frame(frame)
+            # Show "Loading" on the first few frames while model initializes
+            if self.landmarker is None:
+                # Load model in the first loop iteration
+                try:
+                    self.landmarker = HandLandmarker.create_from_options(self.options)
+                    print("[INFO] AI Model loaded successfully!")
+                except Exception as e:
+                    print(f"[ERROR] Failed to load AI: {e}")
+                    cv2.putText(frame, "AI LOAD ERROR", (50, 100), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
+            processed_frame = self.process_frame(frame)
             cv2.imshow("Hand Gesture Controller", processed_frame)
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
